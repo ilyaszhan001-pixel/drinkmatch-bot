@@ -70,8 +70,85 @@ def init_db():
     )
     """)
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS chat_sessions (
+        user_id INTEGER PRIMARY KEY,
+        partner_id INTEGER
+    )
+    """)
+
     conn.commit()
     conn.close()
+
+
+def are_matched(user1: int, user2: int) -> bool:
+    u1, u2 = sorted([user1, user2])
+    conn = sqlite3.connect("drinkmatch.db")
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM matches WHERE user1 = ? AND user2 = ?", (u1, u2))
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
+
+
+def set_chat_partner(user_id: int, partner_id: int):
+    conn = sqlite3.connect("drinkmatch.db")
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR REPLACE INTO chat_sessions (user_id, partner_id) VALUES (?, ?)",
+        (user_id, partner_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_chat_partner(user_id: int) -> Optional[int]:
+    conn = sqlite3.connect("drinkmatch.db")
+    cur = conn.cursor()
+    cur.execute("SELECT partner_id FROM chat_sessions WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def clear_chat_partner(user_id: int):
+    conn = sqlite3.connect("drinkmatch.db")
+    cur = conn.cursor()
+    cur.execute("DELETE FROM chat_sessions WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_user_matches(user_id: int) -> list:
+    conn = sqlite3.connect("drinkmatch.db")
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT * FROM matches
+        WHERE user1 = ? OR user2 = ?
+        ORDER BY created_at DESC
+    """, (user_id, user_id))
+    rows = cur.fetchall()
+    conn.close()
+    result = []
+    for row in rows:
+        other_id = row["user2"] if row["user1"] == user_id else row["user1"]
+        other = get_user(other_id)
+        if other:
+            result.append(other)
+    return result
+
+
+def delete_user(user_id: int):
+    conn = sqlite3.connect("drinkmatch.db")
+    cur = conn.cursor()
+    cur.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+    cur.execute("DELETE FROM likes WHERE from_user = ? OR to_user = ?", (user_id, user_id))
+    cur.execute("DELETE FROM matches WHERE user1 = ? OR user2 = ?", (user_id, user_id))
+    cur.execute("DELETE FROM chat_sessions WHERE user_id = ? OR partner_id = ?", (user_id, user_id))
+    conn.commit()
+    conn.close()
+
 
 def get_user(user_id: int) -> Optional[dict]:
     conn = sqlite3.connect("drinkmatch.db")
@@ -222,6 +299,10 @@ class Search(StatesGroup):
     viewing = State()
 
 
+class Chat(StatesGroup):
+    talking = State()
+
+
 # ==================== КЛАВИАТУРЫ ====================
 def gender_kb():
     builder = ReplyKeyboardBuilder()
@@ -264,10 +345,44 @@ def main_menu_kb():
         KeyboardButton(text="🔍 Искать"),
         KeyboardButton(text="👤 Мой профиль"),
         KeyboardButton(text="❤️ Мои матчи"),
-        KeyboardButton(text="✏️ Редактировать")
+        KeyboardButton(text="✏️ Редактировать"),
+        KeyboardButton(text="🗑 Удалить анкету")
     )
     builder.adjust(2)
     return builder.as_markup(resize_keyboard=True)
+
+
+def confirm_delete_kb():
+    builder = InlineKeyboardBuilder()
+    builder.add(
+        InlineKeyboardButton(text="Да, удалить", callback_data="delete_yes"),
+        InlineKeyboardButton(text="Отмена", callback_data="delete_no")
+    )
+    return builder.as_markup()
+
+
+def chat_kb():
+    builder = ReplyKeyboardBuilder()
+    builder.add(KeyboardButton(text="🚪 Выйти из чата"))
+    return builder.as_markup(resize_keyboard=True)
+
+
+def open_chat_kb(target_id: int):
+    builder = InlineKeyboardBuilder()
+    builder.add(InlineKeyboardButton(text="💬 Написать в боте", callback_data=f"chat_{target_id}"))
+    return builder.as_markup()
+
+
+def matches_kb(matches: list):
+    builder = InlineKeyboardBuilder()
+    for m in matches:
+        name = m.get("full_name") or "Пользователь"
+        builder.add(InlineKeyboardButton(
+            text=f"💬 {name}, {m['age']}",
+            callback_data=f"chat_{m['user_id']}"
+        ))
+    builder.adjust(1)
+    return builder.as_markup()
 
 def profile_actions_kb(target_id: int):
     builder = InlineKeyboardBuilder()
@@ -497,26 +612,26 @@ async def process_like(callback: CallbackQuery, state: FSMContext):
     if is_match:
         target = get_user(target_id)
         me = get_user(from_id)
+        tname = target["full_name"] if target else "пользователем"
+        mname = me["full_name"] if me else "пользователем"
 
-        # Уведомляем обоих
-        match_text = (
-            "🎉 <b>У вас матч!</b>\n\n"
-            f"Вы понравились друг другу с {target['full_name'] or 'пользователем'}.\n"
-            f"Напишите: @{target['username']}" if target.get("username") else
-            "🎉 <b>У вас матч!</b>\n\nНапишите друг другу через бота позже (функция чата в разработке)."
+        await callback.message.answer(
+            f"🎉 <b>У вас матч!</b>\n\n"
+            f"Вы понравились друг другу с {tname}.\n"
+            "Можете писать прямо здесь, в боте.",
+            parse_mode="HTML",
+            reply_markup=open_chat_kb(target_id)
         )
 
-        await callback.message.answer(match_text, parse_mode="HTML")
-
         try:
-            bot = callback.bot
-            other_text = (
+            await callback.bot.send_message(
+                target_id,
                 f"🎉 <b>У вас матч!</b>\n\n"
-                f"Вы понравились друг другу с {me['full_name'] or 'пользователем'}.\n"
+                f"Вы понравились друг другу с {mname}.\n"
+                "Можете писать прямо здесь, в боте.",
+                parse_mode="HTML",
+                reply_markup=open_chat_kb(from_id)
             )
-            if me.get("username"):
-                other_text += f"Напишите: @{me['username']}"
-            await bot.send_message(target_id, other_text, parse_mode="HTML")
         except Exception:
             pass
     else:
@@ -563,30 +678,77 @@ async def my_profile(message: Message):
 
 @router.message(F.text == "❤️ Мои матчи")
 async def my_matches(message: Message):
-    conn = sqlite3.connect("drinkmatch.db")
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT * FROM matches 
-        WHERE user1 = ? OR user2 = ?
-        ORDER BY created_at DESC
-    """, (message.from_user.id, message.from_user.id))
-    rows = cur.fetchall()
-    conn.close()
-
-    if not rows:
+    matches = get_user_matches(message.from_user.id)
+    if not matches:
         await message.answer("Пока нет матчей 😢\nИщи людей через кнопку «Искать»")
         return
 
-    text = "<b>Твои матчи:</b>\n\n"
-    for row in rows:
-        other_id = row["user2"] if row["user1"] == message.from_user.id else row["user1"]
-        other = get_user(other_id)
-        if other:
-            uname = f"@{other['username']}" if other.get("username") else "без username"
-            text += f"• {other['full_name'] or 'Пользователь'} ({other['age']}) — {uname}\n"
+    text = "<b>Твои матчи:</b>\nНажми на человека, чтобы написать ему в боте.\n"
+    await message.answer(text, parse_mode="HTML", reply_markup=matches_kb(matches))
 
-    await message.answer(text, parse_mode="HTML")
+
+@router.callback_query(F.data.startswith("chat_"))
+async def open_chat(callback: CallbackQuery, state: FSMContext):
+    partner_id = int(callback.data.split("_")[1])
+    my_id = callback.from_user.id
+
+    if not are_matched(my_id, partner_id):
+        await callback.answer("Чат доступен только после взаимного лайка", show_alert=True)
+        return
+
+    partner = get_user(partner_id)
+    name = partner["full_name"] if partner else "пользователем"
+    set_chat_partner(my_id, partner_id)
+    await state.set_state(Chat.talking)
+    await callback.message.answer(
+        f"💬 Чат с {name} открыт.\n"
+        "Пиши сюда — сообщения уйдут собеседнику через бота.\n"
+        "Чтобы выйти, нажми «Выйти из чата».",
+        reply_markup=chat_kb()
+    )
+    await callback.answer()
+
+
+@router.message(Chat.talking, F.text == "🚪 Выйти из чата")
+async def exit_chat(message: Message, state: FSMContext):
+    clear_chat_partner(message.from_user.id)
+    await state.clear()
+    await message.answer("Чат закрыт. Ты снова в главном меню.", reply_markup=main_menu_kb())
+
+
+@router.message(Chat.talking)
+async def relay_chat(message: Message, state: FSMContext):
+    my_id = message.from_user.id
+    partner_id = get_chat_partner(my_id)
+
+    if not partner_id or not are_matched(my_id, partner_id):
+        clear_chat_partner(my_id)
+        await state.clear()
+        await message.answer("Чат недоступен. Вернулся в меню.", reply_markup=main_menu_kb())
+        return
+
+    me = get_user(my_id)
+    name = me["full_name"] if me else "Собеседник"
+
+    try:
+        if message.text:
+            await message.bot.send_message(
+                partner_id,
+                f"💬 <b>{name}:</b>\n{message.text}",
+                parse_mode="HTML"
+            )
+        elif message.photo:
+            await message.bot.send_photo(
+                partner_id,
+                photo=message.photo[-1].file_id,
+                caption=f"💬 Фото от {name}"
+            )
+        else:
+            await message.answer("Сейчас можно отправлять текст или фото.")
+            return
+        await message.answer("Отправлено ✅")
+    except Exception:
+        await message.answer("Не удалось доставить сообщение. Возможно, человек ещё не запускал бота.")
 
 
 @router.message(F.text == "✏️ Редактировать")
@@ -595,6 +757,37 @@ async def edit_profile(message: Message, state: FSMContext):
         "Чтобы изменить анкету — просто пройди регистрацию заново.\n"
         "Напиши /start и создай новую анкету (старая перезапишется)."
     )
+
+
+@router.message(F.text == "🗑 Удалить анкету")
+async def ask_delete_profile(message: Message):
+    user = get_user(message.from_user.id)
+    if not user:
+        await message.answer("Анкета уже не найдена.")
+        return
+    await message.answer(
+        "Точно удалить анкету?\n"
+        "Пропадут профиль, лайки и матчи. Это нельзя отменить.",
+        reply_markup=confirm_delete_kb()
+    )
+
+
+@router.callback_query(F.data == "delete_yes")
+async def confirm_delete_profile(callback: CallbackQuery, state: FSMContext):
+    delete_user(callback.from_user.id)
+    await state.clear()
+    await callback.message.answer(
+        "Анкета удалена.\n"
+        "Если захочешь снова пользоваться ботом — напиши /start.",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    await callback.answer("Анкета удалена")
+
+
+@router.callback_query(F.data == "delete_no")
+async def cancel_delete_profile(callback: CallbackQuery):
+    await callback.message.answer("Ок, анкета на месте.", reply_markup=main_menu_kb())
+    await callback.answer("Отменено")
 
 
 # ==================== ЗАПУСК ====================
