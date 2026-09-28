@@ -48,10 +48,21 @@ def init_db():
         interests TEXT,
         bio TEXT,
         photo_id TEXT,
+        lat REAL,
+        lon REAL,
         is_active INTEGER DEFAULT 1,
         created_at TEXT
     )
     """)
+    # Мягкая миграция для старых баз
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN lat REAL")
+    except Exception:
+        pass
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN lon REAL")
+    except Exception:
+        pass
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS likes (
@@ -133,7 +144,7 @@ def save_user(data: dict):
 
 
 def update_user_field(user_id: int, field: str, value):
-    allowed = {"gender", "age", "city", "looking_for", "alcohol", "smoking", "interests", "bio", "photo_id", "username", "full_name"}
+    allowed = {"gender", "age", "city", "looking_for", "alcohol", "smoking", "interests", "bio", "photo_id", "username", "full_name", "lat", "lon"}
     if field not in allowed:
         return
     conn = get_conn()
@@ -294,28 +305,87 @@ def get_candidates(user_id: int, limit: int = 30) -> list:
 
 
 def calc_compatibility(me: dict, other: dict) -> int:
-    score = 40
-    if me["alcohol"] == "Пью всё" or other["alcohol"] == "Пью всё":
-        score += 20
-    elif me["alcohol"] == other["alcohol"]:
+    """
+    Считаем совместимость 0–100.
+    Алкоголь, курение, общие интересы и разница в возрасте.
+    """
+    score = 0
+
+    # --- Алкоголь (макс 30) ---
+    a1 = (me.get("alcohol") or "").lower()
+    a2 = (other.get("alcohol") or "").lower()
+    if a1 == a2:
+        score += 30          # полное совпадение
+    elif "всё" in a1 or "всё" in a2:
+        score += 22          # один из них пьёт всё
+    else:
+        score += 8           # разные предпочтения
+
+    # --- Курение (макс 25) ---
+    s1 = (me.get("smoking") or "").lower()
+    s2 = (other.get("smoking") or "").lower()
+    if s1 == s2:
         score += 25
-    else:
-        score += 5
-
-    if me["smoking"] == other["smoking"]:
-        score += 20
-    elif "всё" in me["smoking"].lower() or "всё" in other["smoking"].lower():
-        score += 15
-    elif me["smoking"] == "Не курю" or other["smoking"] == "Не курю":
+    elif "всё" in s1 or "всё" in s2:
+        score += 18
+    elif "не курю" in s1 and "не курю" not in s2:
+        score += 5           # один курит, другой нет — слабо
+    elif "не курю" in s2 and "не курю" not in s1:
         score += 5
     else:
-        score += 8
+        score += 12
 
+    # --- Интересы (макс 30) ---
     my_ints = set(i.strip().lower() for i in (me.get("interests") or "").split(",") if i.strip())
     other_ints = set(i.strip().lower() for i in (other.get("interests") or "").split(",") if i.strip())
-    common = my_ints & other_ints
-    score += min(len(common) * 8, 25)
-    return min(score, 100)
+    if my_ints and other_ints:
+        common = my_ints & other_ints
+        # Чем больше общих интересов — тем выше
+        ratio = len(common) / max(len(my_ints | other_ints), 1)
+        score += int(ratio * 30)
+        # Бонус за каждый общий интерес
+        score += min(len(common) * 4, 15)
+    else:
+        score += 5
+
+    # --- Возраст (макс 15, штраф за большую разницу) ---
+    try:
+        age_diff = abs(int(me.get("age", 25)) - int(other.get("age", 25)))
+        if age_diff <= 2:
+            score += 15
+        elif age_diff <= 5:
+            score += 10
+        elif age_diff <= 10:
+            score += 5
+        else:
+            score += 0
+    except Exception:
+        score += 5
+
+    return max(15, min(score, 98))  # не даём 0 и 100
+
+
+
+def haversine_km(lat1, lon1, lat2, lon2) -> float:
+    """Расстояние в км между двумя точками"""
+    from math import radians, sin, cos, sqrt, atan2
+    if None in (lat1, lon1, lat2, lon2):
+        return None
+    R = 6371.0
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1-a))
+    return round(R * c, 1)
+
+
+def format_distance(me: dict, other: dict) -> str:
+    dist = haversine_km(me.get("lat"), me.get("lon"), other.get("lat"), other.get("lon"))
+    if dist is None:
+        return ""
+    if dist < 1:
+        return " · рядом"
+    return f" · ~{dist} км"
 
 
 def get_matches_list(user_id: int) -> list:
@@ -364,6 +434,7 @@ class Edit(StatesGroup):
     interests = State()
     bio = State()
     photo = State()
+    location = State()
 
 
 class Search(StatesGroup):
@@ -413,6 +484,16 @@ def main_menu_kb():
     b.adjust(2)
     return b.as_markup(resize_keyboard=True)
 
+def chat_kb():
+    """Клавиатура когда пользователь в режиме переписки"""
+    b = ReplyKeyboardBuilder()
+    b.add(KeyboardButton(text="🚪 Выйти из чата"))
+    b.add(KeyboardButton(text="🔍 Искать"),
+          KeyboardButton(text="💬 Чаты"),
+          KeyboardButton(text="❤️ Мои матчи"))
+    b.adjust(1, 3)
+    return b.as_markup(resize_keyboard=True)
+
 def profile_actions_kb(target_id: int):
     b = InlineKeyboardBuilder()
     b.add(InlineKeyboardButton(text="➕ Плюсвайб", callback_data=f"like_{target_id}"),
@@ -437,6 +518,7 @@ def edit_menu_kb():
         InlineKeyboardButton(text="Интересы", callback_data="edit_interests"),
         InlineKeyboardButton(text="О себе", callback_data="edit_bio"),
         InlineKeyboardButton(text="Фото", callback_data="edit_photo"),
+        InlineKeyboardButton(text="📍 Геолокация", callback_data="edit_location"),
         InlineKeyboardButton(text="« Назад", callback_data="edit_back"),
     )
     b.adjust(2)
@@ -615,7 +697,10 @@ async def reg_photo_wrong(message: Message):
 # ==================== ГЛАВНОЕ МЕНЮ ====================
 @router.message(F.text == "🔍 Искать")
 async def start_search(message: Message, state: FSMContext):
+    # Всегда полностью сбрасываем состояние поиска
     set_chat_partner(message.from_user.id, None)
+    await state.clear()
+
     user = get_user(message.from_user.id)
     if not user:
         await message.answer("Сначала создай анкету через /start")
@@ -623,11 +708,29 @@ async def start_search(message: Message, state: FSMContext):
 
     candidates = get_candidates(message.from_user.id)
     if not candidates:
-        await message.answer("Пока нет подходящих анкет в твоём городе. Зайди позже 🍻")
+        await message.answer(
+            "Пока нет подходящих анкет в твоём городе.\n"
+            "Попробуй позже или попроси друзей зарегистрироваться 🍻",
+            reply_markup=main_menu_kb()
+        )
+        return
+
+    # Оставляем только реально существующих пользователей
+    valid_ids = []
+    for c in candidates:
+        u = get_user(c["user_id"])
+        if u and u.get("is_active", 1):
+            valid_ids.append(c["user_id"])
+
+    if not valid_ids:
+        await message.answer(
+            "Пока нет подходящих анкет.\nНажми «Искать» чуть позже.",
+            reply_markup=main_menu_kb()
+        )
         return
 
     await state.set_state(Search.viewing)
-    await state.update_data(candidates=[c["user_id"] for c in candidates], index=0)
+    await state.update_data(candidates=valid_ids, index=0)
     await show_next_profile(message, state)
 
 
@@ -636,24 +739,30 @@ async def show_next_profile(message: Message, state: FSMContext):
     candidates = data.get("candidates", [])
     index = data.get("index", 0)
 
+    # Защита от зацикливания
     if index >= len(candidates):
-        await message.answer("Анкеты закончились. Нажми «Искать» снова.", reply_markup=main_menu_kb())
+        await message.answer(
+            "Анкеты закончились.\nНажми «🔍 Искать», чтобы начать заново.",
+            reply_markup=main_menu_kb()
+        )
         await state.clear()
         return
 
     target_id = candidates[index]
     target = get_user(target_id)
-    me = get_user(message.chat.id)
+    me = get_user(message.from_user.id if hasattr(message, "from_user") else message.chat.id)
 
     if not target or not me:
+        # Пропускаем битую анкету и идём дальше
         await state.update_data(index=index + 1)
         await show_next_profile(message, state)
         return
 
     compat = calc_compatibility(me, target)
+    dist_str = format_distance(me, target)
 
     text = (
-        f"<b>{target['full_name'] or 'Пользователь'}</b>, {target['age']}\n"
+        f"<b>{target['full_name'] or 'Пользователь'}</b>, {target['age']}{dist_str}\n"
         f"📍 {target['city']}\n\n"
         f"🍺 {target['alcohol']}\n"
         f"🚬 {target['smoking']}\n\n"
@@ -835,6 +944,19 @@ async def edit_choose(callback: CallbackQuery, state: FSMContext):
             reply_markup=ReplyKeyboardRemove()
         )
         await state.set_state(Edit.photo)
+    elif action == "location":
+        from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
+        loc_kb = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="📍 Отправить геолокацию", request_location=True)],
+                      [KeyboardButton(text="Пропустить")]],
+            resize_keyboard=True
+        )
+        await callback.message.answer(
+            "Отправь свою геолокацию, чтобы люди видели примерное расстояние до тебя.\n"
+            "Можно пропустить.",
+            reply_markup=loc_kb
+        )
+        await state.set_state(Edit.location)
 
 
 @router.message(Edit.gender)
@@ -932,6 +1054,28 @@ async def edit_photo_wrong(message: Message):
     await message.answer("Пришли именно фото с лицом.")
 
 
+
+
+@router.message(Edit.location, F.location)
+async def edit_location(message: Message, state: FSMContext):
+    lat = message.location.latitude
+    lon = message.location.longitude
+    update_user_field(message.from_user.id, "lat", lat)
+    update_user_field(message.from_user.id, "lon", lon)
+    await message.answer("Геолокация сохранена ✅\nТеперь в анкетах будет показываться расстояние.", reply_markup=main_menu_kb())
+    await state.clear()
+
+
+@router.message(Edit.location)
+async def edit_location_skip(message: Message, state: FSMContext):
+    if message.text and "пропустить" in message.text.lower():
+        await message.answer("Геолокация не изменена.", reply_markup=main_menu_kb())
+    else:
+        await message.answer("Нажми кнопку «📍 Отправить геолокацию» или «Пропустить».")
+        return
+    await state.clear()
+
+
 # ==================== ЧАТ ВНУТРИ БОТА ====================
 @router.callback_query(F.data.startswith("chat_"))
 async def start_chat(callback: CallbackQuery, state: FSMContext):
@@ -953,15 +1097,55 @@ async def start_chat(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer(
         f"Ты в чате с <b>{name}</b>.\n\n"
         f"Просто пиши сообщения — они будут приходить собеседнику.\n"
-        f"Чтобы выйти из чата — нажми «🔍 Искать» или любую кнопку меню.",
+        f"Чтобы выйти — нажми «🚪 Выйти из чата».",
         parse_mode="HTML",
-        reply_markup=main_menu_kb()
+        reply_markup=chat_kb()
     )
     await callback.answer()
 
 
 @router.message(Chat.talking)
 async def process_chat_message(message: Message, state: FSMContext):
+    # Сначала проверяем кнопки меню — они имеют приоритет и закрывают чат
+    menu_buttons = {
+        "🚪 Выйти из чата",
+        "🔍 Искать",
+        "💬 Чаты",
+        "❤️ Мои матчи",
+        "👤 Мой профиль",
+        "✏️ Редактировать",
+        "🗑 Удалить анкету",
+    }
+    if message.text in menu_buttons:
+        set_chat_partner(message.from_user.id, None)
+        await state.clear()
+        if message.text == "🚪 Выйти из чата":
+            await message.answer("Ты вышел из чата. Можешь вернуться через «💬 Чаты».", reply_markup=main_menu_kb())
+            return
+        # Для остальных кнопок — просто выходим из состояния чата,
+        # дальше сработают обычные обработчики этих кнопок
+        # Но так как мы уже в этом хендлере, нужно вручную вызвать логику
+        if message.text == "🔍 Искать":
+            await start_search(message, state)
+            return
+        if message.text == "💬 Чаты":
+            await show_chats(message, state)
+            return
+        if message.text == "❤️ Мои матчи":
+            await my_matches(message, state)
+            return
+        if message.text == "👤 Мой профиль":
+            await my_profile(message, state)
+            return
+        if message.text == "✏️ Редактировать":
+            await edit_start(message, state)
+            return
+        if message.text == "🗑 Удалить анкету":
+            await ask_delete(message)
+            return
+        await message.answer("Главное меню:", reply_markup=main_menu_kb())
+        return
+
     partner_id = get_chat_partner(message.from_user.id)
     if not partner_id:
         await state.clear()
@@ -969,7 +1153,7 @@ async def process_chat_message(message: Message, state: FSMContext):
         return
 
     if is_blocked(message.from_user.id, partner_id) or is_blocked(partner_id, message.from_user.id):
-        await message.answer("Переписка недоступна (блокировка).")
+        await message.answer("Переписка недоступна (блокировка).", reply_markup=main_menu_kb())
         set_chat_partner(message.from_user.id, None)
         await state.clear()
         return
@@ -984,7 +1168,6 @@ async def process_chat_message(message: Message, state: FSMContext):
     me = get_user(message.from_user.id)
     sender_name = me["full_name"] if me else "Кто-то"
 
-    # Отправляем сообщение собеседнику + уведомление
     try:
         await message.bot.send_message(
             partner_id,
@@ -992,10 +1175,10 @@ async def process_chat_message(message: Message, state: FSMContext):
             f"<i>Чтобы ответить — нажми «Написать в боте» в матчах или открой чат.</i>",
             parse_mode="HTML"
         )
-        # Если собеседник тоже в чате с нами — можно было бы просто переслать, но уведомление всегда приходит.
     except Exception as e:
         logger.error(f"Не удалось отправить сообщение: {e}")
         await message.answer("Не удалось доставить сообщение. Возможно, пользователь заблокировал бота.")
+        return
 
     await message.answer("Сообщение отправлено ✅")
 
