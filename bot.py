@@ -4,6 +4,7 @@ import sqlite3
 import os
 from datetime import datetime
 from typing import Optional
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
@@ -25,8 +26,18 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ==================== БАЗА ДАННЫХ ====================
+def get_db_path():
+    """Путь к базе. На Railway Volume монтируем в /data"""
+    data_dir = Path("/data")
+    if data_dir.exists() and data_dir.is_dir():
+        data_dir.mkdir(parents=True, exist_ok=True)
+        return str(data_dir / "drinkmatch.db")
+    # Локально или если volume ещё не подключён
+    Path("data").mkdir(exist_ok=True)
+    return "data/drinkmatch.db"
+
 def get_conn():
-    conn = sqlite3.connect("drinkmatch.db")
+    conn = sqlite3.connect(get_db_path())
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -48,6 +59,7 @@ def init_db():
         interests TEXT,
         bio TEXT,
         photo_id TEXT,
+        height INTEGER,
         lat REAL,
         lon REAL,
         is_active INTEGER DEFAULT 1,
@@ -55,14 +67,11 @@ def init_db():
     )
     """)
     # Мягкая миграция для старых баз
-    try:
-        cur.execute("ALTER TABLE users ADD COLUMN lat REAL")
-    except Exception:
-        pass
-    try:
-        cur.execute("ALTER TABLE users ADD COLUMN lon REAL")
-    except Exception:
-        pass
+    for col, typ in [("lat", "REAL"), ("lon", "REAL"), ("height", "INTEGER")]:
+        try:
+            cur.execute(f"ALTER TABLE users ADD COLUMN {col} {typ}")
+        except Exception:
+            pass
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS likes (
@@ -131,20 +140,21 @@ def save_user(data: dict):
     cur = conn.cursor()
     cur.execute("""
     INSERT OR REPLACE INTO users 
-    (user_id, username, full_name, gender, age, city, looking_for, alcohol, smoking, interests, bio, photo_id, is_active, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+    (user_id, username, full_name, gender, age, city, looking_for, alcohol, smoking, interests, bio, photo_id, height, lat, lon, is_active, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
     """, (
         data["user_id"], data.get("username"), data.get("full_name"),
         data["gender"], data["age"], data["city"], data["looking_for"],
         data["alcohol"], data["smoking"], data["interests"], data["bio"],
-        data.get("photo_id"), datetime.now().isoformat()
+        data.get("photo_id"), data.get("height"), data.get("lat"), data.get("lon"),
+        datetime.now().isoformat()
     ))
     conn.commit()
     conn.close()
 
 
 def update_user_field(user_id: int, field: str, value):
-    allowed = {"gender", "age", "city", "looking_for", "alcohol", "smoking", "interests", "bio", "photo_id", "username", "full_name", "lat", "lon"}
+    allowed = {"gender", "age", "city", "looking_for", "alcohol", "smoking", "interests", "bio", "photo_id", "username", "full_name", "lat", "lon", "height"}
     if field not in allowed:
         return
     conn = get_conn()
@@ -414,7 +424,9 @@ def get_matches_list(user_id: int) -> list:
 class Reg(StatesGroup):
     gender = State()
     age = State()
+    height = State()
     city = State()
+    location = State()
     looking_for = State()
     alcohol = State()
     smoking = State()
@@ -427,6 +439,7 @@ class Edit(StatesGroup):
     choosing = State()
     gender = State()
     age = State()
+    height = State()
     city = State()
     looking_for = State()
     alcohol = State()
@@ -511,6 +524,7 @@ def edit_menu_kb():
     b.add(
         InlineKeyboardButton(text="Пол", callback_data="edit_gender"),
         InlineKeyboardButton(text="Возраст", callback_data="edit_age"),
+        InlineKeyboardButton(text="Рост", callback_data="edit_height"),
         InlineKeyboardButton(text="Город", callback_data="edit_city"),
         InlineKeyboardButton(text="Кого ищу", callback_data="edit_looking"),
         InlineKeyboardButton(text="Алкоголь", callback_data="edit_alcohol"),
@@ -585,6 +599,20 @@ async def reg_age(message: Message, state: FSMContext):
         await message.answer("Возраст должен быть от 18 до 80")
         return
     await state.update_data(age=age)
+    await message.answer("Какой у тебя рост? (в см, например: 175)")
+    await state.set_state(Reg.height)
+
+
+@router.message(Reg.height)
+async def reg_height(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("Напиши рост числом в см, например: 175")
+        return
+    height = int(message.text)
+    if height < 140 or height > 230:
+        await message.answer("Укажи реальный рост (от 140 до 230 см)")
+        return
+    await state.update_data(height=height)
     await message.answer("В каком городе ты находишься?")
     await state.set_state(Reg.city)
 
@@ -593,6 +621,34 @@ async def reg_age(message: Message, state: FSMContext):
 async def reg_city(message: Message, state: FSMContext):
     city = message.text.strip().title()
     await state.update_data(city=city)
+    from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+    loc_kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📍 Отправить геолокацию", request_location=True)],
+            [KeyboardButton(text="Пропустить")]
+        ],
+        resize_keyboard=True
+    )
+    await message.answer(
+        "Отправь свою геолокацию — так другие будут видеть расстояние до тебя.\n"
+        "Можно пропустить.",
+        reply_markup=loc_kb
+    )
+    await state.set_state(Reg.location)
+
+
+@router.message(Reg.location, F.location)
+async def reg_location(message: Message, state: FSMContext):
+    await state.update_data(lat=message.location.latitude, lon=message.location.longitude)
+    await message.answer("Геолокация сохранена ✅", reply_markup=ReplyKeyboardRemove())
+    await message.answer("Кого ты ищешь?", reply_markup=looking_kb())
+    await state.set_state(Reg.looking_for)
+
+
+@router.message(Reg.location)
+async def reg_location_skip(message: Message, state: FSMContext):
+    await state.update_data(lat=None, lon=None)
+    await message.answer("Геолокацию можно добавить позже в настройках.", reply_markup=ReplyKeyboardRemove())
     await message.answer("Кого ты ищешь?", reply_markup=looking_kb())
     await state.set_state(Reg.looking_for)
 
@@ -671,13 +727,16 @@ async def reg_photo(message: Message, state: FSMContext):
         "full_name": message.from_user.full_name,
         "gender": data["gender"],
         "age": data["age"],
+        "height": data.get("height"),
         "city": data["city"],
         "looking_for": data["looking_for"],
         "alcohol": data["alcohol"],
         "smoking": data["smoking"],
         "interests": data["interests"],
         "bio": data["bio"],
-        "photo_id": photo_id
+        "photo_id": photo_id,
+        "lat": data.get("lat"),
+        "lon": data.get("lon"),
     }
     save_user(user_data)
 
@@ -761,8 +820,9 @@ async def show_next_profile(message: Message, state: FSMContext):
     compat = calc_compatibility(me, target)
     dist_str = format_distance(me, target)
 
+    height_str = f", {target['height']} см" if target.get("height") else ""
     text = (
-        f"<b>{target['full_name'] or 'Пользователь'}</b>, {target['age']}{dist_str}\n"
+        f"<b>{target['full_name'] or 'Пользователь'}</b>, {target['age']}{height_str}{dist_str}\n"
         f"📍 {target['city']}\n\n"
         f"🍺 {target['alcohol']}\n"
         f"🚬 {target['smoking']}\n\n"
@@ -854,9 +914,10 @@ async def my_profile(message: Message, state: FSMContext):
         await message.answer("Анкета не найдена. Напиши /start")
         return
 
+    height_str = f", {user['height']} см" if user.get("height") else ""
     text = (
         f"<b>Твой профиль</b>\n\n"
-        f"{user['full_name']}, {user['age']}\n"
+        f"{user['full_name']}, {user['age']}{height_str}\n"
         f"📍 {user['city']}\n"
         f"Ищет: {user['looking_for']}\n\n"
         f"🍺 {user['alcohol']}\n"
@@ -918,6 +979,9 @@ async def edit_choose(callback: CallbackQuery, state: FSMContext):
     elif action == "age":
         await callback.message.answer("Напиши новый возраст:", reply_markup=ReplyKeyboardRemove())
         await state.set_state(Edit.age)
+    elif action == "height":
+        await callback.message.answer("Напиши новый рост в см (например 175):", reply_markup=ReplyKeyboardRemove())
+        await state.set_state(Edit.height)
     elif action == "city":
         await callback.message.answer("Напиши новый город:", reply_markup=ReplyKeyboardRemove())
         await state.set_state(Edit.city)
@@ -981,6 +1045,20 @@ async def edit_age(message: Message, state: FSMContext):
         return
     update_user_field(message.from_user.id, "age", age)
     await message.answer("Возраст обновлён ✅", reply_markup=main_menu_kb())
+    await state.clear()
+
+
+@router.message(Edit.height)
+async def edit_height(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("Напиши число в см")
+        return
+    height = int(message.text)
+    if height < 140 or height > 230:
+        await message.answer("От 140 до 230 см")
+        return
+    update_user_field(message.from_user.id, "height", height)
+    await message.answer("Рост обновлён ✅", reply_markup=main_menu_kb())
     await state.clear()
 
 
