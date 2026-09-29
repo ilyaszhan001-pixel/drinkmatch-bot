@@ -577,6 +577,18 @@ def main_menu_kb():
     b.adjust(2)
     return b.as_markup(resize_keyboard=True)
 
+def stats_text() -> str:
+    total = count_users()
+    return f"🟢 Бот онлайн\n👥 Зарегистрировано: <b>{total}</b>"
+
+async def send_main_menu(message: Message, extra: str = ""):
+    """Показать меню с актуальной статистикой"""
+    text = stats_text()
+    if extra:
+        text = extra.strip() + "\n\n" + text
+    await message.answer(text, reply_markup=main_menu_kb(), parse_mode="HTML")
+
+
 def chat_kb():
     """Клавиатура когда пользователь в режиме переписки"""
     b = ReplyKeyboardBuilder()
@@ -845,23 +857,25 @@ async def reg_photo_wrong(message: Message):
 
 # ==================== ГЛАВНОЕ МЕНЮ ====================
 @router.message(F.text == "🔍 Искать")
-async def start_search(message: Message, state: FSMContext, relax_gender: bool = False, relax_city: bool = False):
-    set_chat_partner(message.from_user.id, None)
+async def start_search(message: Message, state: FSMContext, relax_gender: bool = False, relax_city: bool = False, user_id: int = None):
+    # user_id нужен когда вызываем из callback (там message.from_user — это бот)
+    uid = user_id or message.from_user.id
+    set_chat_partner(uid, None)
     await state.clear()
 
-    user = get_user(message.from_user.id)
+    user = get_user(uid)
     if not user:
         await message.answer("Сначала создай анкету через /start")
         return
 
     # Пробуем строгий поиск → потом расширяем
-    candidates = get_candidates(message.from_user.id, relax_gender=relax_gender, relax_city=relax_city)
+    candidates = get_candidates(uid, relax_gender=relax_gender, relax_city=relax_city)
 
     if not candidates and not relax_gender and not relax_city:
         # Никого в городе с нужным полом — предлагаем искать всех
         b = InlineKeyboardBuilder()
         b.add(InlineKeyboardButton(text="Искать всех в моём городе", callback_data="search_relax_gender"))
-        b.add(InlineKeyboardButton(text="Искать в других городах", callback_data="search_relax_city"))
+        b.add(InlineKeyboardButton(text="🌍 Другие города и страны", callback_data="search_relax_city"))
         b.adjust(1)
         await message.answer(
             "В твоём городе пока нет подходящих анкет по выбранному полу.\n\n"
@@ -872,12 +886,12 @@ async def start_search(message: Message, state: FSMContext, relax_gender: bool =
 
     if not candidates and relax_gender and not relax_city:
         b = InlineKeyboardBuilder()
-        b.add(InlineKeyboardButton(text="Искать в других городах", callback_data="search_relax_city"))
+        b.add(InlineKeyboardButton(text="🌍 Другие города и страны", callback_data="search_relax_city"))
         b.add(InlineKeyboardButton(text="Позже", callback_data="search_cancel"))
         b.adjust(1)
         await message.answer(
             "В твоём городе больше никого нет.\n"
-            "Искать в других городах?",
+            "Искать в других городах и странах?",
             reply_markup=b.as_markup()
         )
         return
@@ -899,7 +913,7 @@ async def start_search(message: Message, state: FSMContext, relax_gender: bool =
     if relax_gender:
         mode.append("все полы")
     if relax_city:
-        mode.append("другие города")
+        mode.append("другие города и страны")
     mode_text = f" ({', '.join(mode)})" if mode else ""
 
     await message.answer(f"Нашёл {len(valid_ids)} анкет{mode_text} 🔍")
@@ -916,23 +930,23 @@ async def search_relax_gender(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text("Ищем всех в твоём городе...")
     except Exception:
         await callback.message.answer("Ищем всех в твоём городе...")
-    await start_search(callback.message, state, relax_gender=True, relax_city=False)
+    await start_search(callback.message, state, relax_gender=True, relax_city=False, user_id=callback.from_user.id)
 
 
 @router.callback_query(F.data == "search_relax_city")
 async def search_relax_city(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     try:
-        await callback.message.edit_text("Ищем в других городах...")
+        await callback.message.edit_text("Ищем в других городах и странах...")
     except Exception:
-        await callback.message.answer("Ищем в других городах...")
-    await start_search(callback.message, state, relax_gender=True, relax_city=True)
+        await callback.message.answer("Ищем в других городах и странах...")
+    await start_search(callback.message, state, relax_gender=True, relax_city=True, user_id=callback.from_user.id)
 
 
 @router.callback_query(F.data == "search_cancel")
 async def search_cancel(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    await callback.message.answer("Ок, заходи позже 🍻", reply_markup=main_menu_kb())
+    await send_main_menu(callback.message, "Ок, заходи позже 🍻")
     await state.clear()
 
 
@@ -952,7 +966,7 @@ async def show_next_profile(message: Message, state: FSMContext):
 
     target_id = candidates[index]
     target = get_user(target_id)
-    me = get_user(message.from_user.id if hasattr(message, "from_user") else message.chat.id)
+    me = get_user(message.chat.id)  # в личке chat.id == user_id
 
     if not target or not me:
         # Пропускаем битую анкету и идём дальше
@@ -1107,7 +1121,7 @@ async def edit_start(message: Message, state: FSMContext):
 @router.callback_query(F.data == "edit_back")
 async def edit_back(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.answer("Главное меню:", reply_markup=main_menu_kb())
+    await send_main_menu(callback.message)
     await callback.answer()
 
 
@@ -1342,7 +1356,7 @@ async def process_chat_message(message: Message, state: FSMContext):
         set_chat_partner(message.from_user.id, None)
         await state.clear()
         if message.text == "🚪 Выйти из чата":
-            await message.answer("Ты вышел из чата. Можешь вернуться через «💬 Чаты».", reply_markup=main_menu_kb())
+            await send_main_menu(message, "Ты вышел из чата. Можешь вернуться через «💬 Чаты».")
             return
         # Для остальных кнопок — просто выходим из состояния чата,
         # дальше сработают обычные обработчики этих кнопок
@@ -1365,7 +1379,7 @@ async def process_chat_message(message: Message, state: FSMContext):
         if message.text == "🗑 Удалить анкету":
             await ask_delete(message)
             return
-        await message.answer("Главное меню:", reply_markup=main_menu_kb())
+        await send_main_menu(message)
         return
 
     partner_id = get_chat_partner(message.from_user.id)
@@ -1458,7 +1472,7 @@ async def confirm_delete(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "delete_no")
 async def cancel_delete(callback: CallbackQuery):
-    await callback.message.answer("Ок, анкета на месте.", reply_markup=main_menu_kb())
+    await send_main_menu(callback.message, "Ок, анкета на месте.")
     await callback.answer()
 
 
