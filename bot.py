@@ -41,6 +41,70 @@ def get_conn():
     conn.row_factory = sqlite3.Row
     return conn
 
+
+# ==================== НОРМАЛИЗАЦИЯ ГОРОДОВ ====================
+CITY_ALIASES = {
+    # Казахстан
+    "астана": "астана", "astana": "астана", "нур-султан": "астана", "nursultan": "астана",
+    "алматы": "алматы", "almaty": "алматы", "алма-ата": "алматы",
+    "шымкент": "шымкент", "shymkent": "шымкент", "чимкент": "шымкент",
+    "караганда": "караганда", "karaganda": "караганда", "қарағанды": "караганда",
+    "актобе": "актобе", "aktobe": "актобе",
+    "тараз": "тараз", "taraz": "тараз",
+    "павлодар": "павлодар", "pavlodar": "павлодар",
+    "усть-каменогорск": "усть-каменогорск", "oskemen": "усть-каменогорск", "өскемен": "усть-каменогорск",
+    "семей": "семей", "semey": "семей",
+    "атырау": "атырау", "atyrau": "атырау",
+    "костанай": "костанай", "kostanay": "костанай",
+    "кызылорда": "кызылорда", "kyzylorda": "кызылорда",
+    "уральск": "уральск", "oral": "уральск", "орал": "уральск",
+    "петропавловск": "петропавловск", "petropavl": "петропавловск",
+    # Россия
+    "москва": "москва", "moscow": "москва", "мск": "москва",
+    "санкт-петербург": "санкт-петербург", "питер": "санкт-петербург", "spb": "санкт-петербург",
+    "спб": "санкт-петербург", "saint petersburg": "санкт-петербург", "st petersburg": "санкт-петербург",
+    "новосибирск": "новосибирск", "novosibirsk": "новосибирск",
+    "екатеринбург": "екатеринбург", "yekaterinburg": "екатеринбург", "екб": "екатеринбург",
+    "казань": "казань", "kazan": "казань",
+    "нижний новгород": "нижний новгород", "нновгород": "нижний новгород",
+    "челябинск": "челябинск", "chelyabinsk": "челябинск",
+    "самара": "самара", "samara": "самара",
+    "омск": "омск", "omsk": "омск",
+    "ростов-на-дону": "ростов-на-дону", "ростов": "ростов-на-дону",
+    "уфа": "уфа", "ufa": "уфа",
+    "красноярск": "красноярск", "krasnoyarsk": "красноярск",
+    "воронеж": "воронеж", "voronezh": "воронеж",
+    "пермь": "пермь", "perm": "пермь",
+    "волгоград": "волгоград", "volgograd": "волгоград",
+    "краснодар": "краснодар", "krasnodar": "краснодар",
+    # Другие
+    "минск": "минск", "minsk": "минск",
+    "киев": "киев", "kyiv": "киев", "київ": "киев",
+    "ташкент": "ташкент", "tashkent": "ташкент",
+    "бишкек": "бишкек", "bishkek": "бишкек",
+    "тбилиси": "тбилиси", "tbilisi": "тбилиси",
+    "ереван": "ереван", "yerevan": "ереван",
+    "баку": "баку", "baku": "баку",
+}
+
+def normalize_city(city: str) -> str:
+    if not city:
+        return ""
+    c = city.strip().lower().replace("ё", "е")
+    # убираем лишние пробелы и дефисы для поиска
+    c_clean = " ".join(c.split())
+    return CITY_ALIASES.get(c_clean, c_clean)
+
+
+def count_users() -> int:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM users WHERE is_active = 1")
+    n = cur.fetchone()[0]
+    conn.close()
+    return n
+
+
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
@@ -273,7 +337,7 @@ def get_chat_partner(user_id: int) -> Optional[int]:
     return row["partner_id"] if row else None
 
 
-def get_candidates(user_id: int, limit: int = 30) -> list:
+def get_candidates(user_id: int, limit: int = 30, relax_gender: bool = False, relax_city: bool = False) -> list:
     me = get_user(user_id)
     if not me:
         return []
@@ -281,25 +345,40 @@ def get_candidates(user_id: int, limit: int = 30) -> list:
     conn = get_conn()
     cur = conn.cursor()
 
-    looking = me["looking_for"]
-    gender_filter = ""
-    if looking == "парней":
-        gender_filter = "AND gender = 'парень'"
-    elif looking == "девушек":
-        gender_filter = "AND gender = 'девушка'"
+    my_city = normalize_city(me.get("city") or "")
+    looking = me.get("looking_for") or "всех"
+    my_gender = me.get("gender") or ""
 
-    my_gender = me["gender"]
+    # Фильтр по полу кандидата (кого я ищу)
+    gender_filter = ""
+    if not relax_gender:
+        if looking == "парней":
+            gender_filter = "AND gender = 'парень'"
+        elif looking == "девушек":
+            gender_filter = "AND gender = 'девушка'"
+
+    # Фильтр: кандидат должен искать мой пол (или всех)
     looking_me = ""
-    if my_gender == "парень":
-        looking_me = "AND (looking_for = 'парней' OR looking_for = 'всех')"
-    else:
-        looking_me = "AND (looking_for = 'девушек' OR looking_for = 'всех')"
+    if not relax_gender:
+        if my_gender == "парень":
+            looking_me = "AND (looking_for = 'парней' OR looking_for = 'всех')"
+        elif my_gender == "девушка":
+            looking_me = "AND (looking_for = 'девушек' OR looking_for = 'всех')"
+
+    # Город
+    city_filter = ""
+    params = [user_id]
+    if not relax_city and my_city:
+        city_filter = "AND city = ?"
+        params.append(my_city)
+
+    params.extend([user_id, user_id, user_id, limit])
 
     cur.execute(f"""
         SELECT * FROM users 
         WHERE user_id != ? 
           AND is_active = 1
-          AND city = ?
+          {city_filter}
           {gender_filter}
           {looking_me}
           AND user_id NOT IN (SELECT to_user FROM likes WHERE from_user = ?)
@@ -307,11 +386,12 @@ def get_candidates(user_id: int, limit: int = 30) -> list:
           AND user_id NOT IN (SELECT from_user FROM blocks WHERE to_user = ?)
         ORDER BY RANDOM()
         LIMIT ?
-    """, (user_id, me["city"], user_id, user_id, user_id, limit))
+    """, params)
 
     rows = cur.fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
 
 
 def calc_compatibility(me: dict, other: dict) -> int:
@@ -560,14 +640,21 @@ async def cmd_start(message: Message, state: FSMContext):
         update_user_field(message.from_user.id, "username", message.from_user.username)
         update_user_field(message.from_user.id, "full_name", message.from_user.full_name)
 
+        total = count_users()
         await message.answer(
             f"С возвращением, {user['full_name'] or message.from_user.first_name}! 🍻\n\n"
+            f"🟢 Бот онлайн\n"
+            f"👥 Зарегистрировано: <b>{total}</b>\n\n"
             "Используй меню ниже:",
-            reply_markup=main_menu_kb()
+            reply_markup=main_menu_kb(),
+            parse_mode="HTML"
         )
     else:
+        total = count_users()
         await message.answer(
             "Привет! Это <b>DrinkMatch</b> 🍻\n\n"
+            f"🟢 Бот онлайн\n"
+            f"👥 Уже зарегистрировано: <b>{total}</b>\n\n"
             "Бот для поиска людей, с кем можно выпить.\n"
             "Давай создадим твою анкету.\n\n"
             "Укажи свой пол:",
@@ -619,7 +706,7 @@ async def reg_height(message: Message, state: FSMContext):
 
 @router.message(Reg.city)
 async def reg_city(message: Message, state: FSMContext):
-    city = message.text.strip().title()
+    city = normalize_city(message.text.strip())
     await state.update_data(city=city)
     from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
     loc_kb = ReplyKeyboardMarkup(
@@ -740,10 +827,13 @@ async def reg_photo(message: Message, state: FSMContext):
     }
     save_user(user_data)
 
+    total = count_users()
     await message.answer(
         "Анкета создана! 🎉\n\n"
+        f"👥 Всего в боте: <b>{total}</b>\n"
         "Теперь ты можешь искать людей.",
-        reply_markup=main_menu_kb()
+        reply_markup=main_menu_kb(),
+        parse_mode="HTML"
     )
     await state.clear()
 
@@ -755,8 +845,7 @@ async def reg_photo_wrong(message: Message):
 
 # ==================== ГЛАВНОЕ МЕНЮ ====================
 @router.message(F.text == "🔍 Искать")
-async def start_search(message: Message, state: FSMContext):
-    # Всегда полностью сбрасываем состояние поиска
+async def start_search(message: Message, state: FSMContext, relax_gender: bool = False, relax_city: bool = False):
     set_chat_partner(message.from_user.id, None)
     await state.clear()
 
@@ -765,32 +854,86 @@ async def start_search(message: Message, state: FSMContext):
         await message.answer("Сначала создай анкету через /start")
         return
 
-    candidates = get_candidates(message.from_user.id)
+    # Пробуем строгий поиск → потом расширяем
+    candidates = get_candidates(message.from_user.id, relax_gender=relax_gender, relax_city=relax_city)
+
+    if not candidates and not relax_gender and not relax_city:
+        # Никого в городе с нужным полом — предлагаем искать всех
+        b = InlineKeyboardBuilder()
+        b.add(InlineKeyboardButton(text="Искать всех в моём городе", callback_data="search_relax_gender"))
+        b.add(InlineKeyboardButton(text="Искать в других городах", callback_data="search_relax_city"))
+        b.adjust(1)
+        await message.answer(
+            "В твоём городе пока нет подходящих анкет по выбранному полу.\n\n"
+            "Что сделать?",
+            reply_markup=b.as_markup()
+        )
+        return
+
+    if not candidates and relax_gender and not relax_city:
+        b = InlineKeyboardBuilder()
+        b.add(InlineKeyboardButton(text="Искать в других городах", callback_data="search_relax_city"))
+        b.add(InlineKeyboardButton(text="Позже", callback_data="search_cancel"))
+        b.adjust(1)
+        await message.answer(
+            "В твоём городе больше никого нет.\n"
+            "Искать в других городах?",
+            reply_markup=b.as_markup()
+        )
+        return
+
     if not candidates:
         await message.answer(
-            "Пока нет подходящих анкет в твоём городе.\n"
-            "Попробуй позже или попроси друзей зарегистрироваться 🍻",
+            "Пока нет подходящих анкет.\n"
+            "Попробуй позже или позови друзей 🍻",
             reply_markup=main_menu_kb()
         )
         return
 
-    # Оставляем только реально существующих пользователей
-    valid_ids = []
-    for c in candidates:
-        u = get_user(c["user_id"])
-        if u and u.get("is_active", 1):
-            valid_ids.append(c["user_id"])
-
+    valid_ids = [c["user_id"] for c in candidates if get_user(c["user_id"])]
     if not valid_ids:
-        await message.answer(
-            "Пока нет подходящих анкет.\nНажми «Искать» чуть позже.",
-            reply_markup=main_menu_kb()
-        )
+        await message.answer("Пока нет анкет. Попробуй позже.", reply_markup=main_menu_kb())
         return
 
+    mode = []
+    if relax_gender:
+        mode.append("все полы")
+    if relax_city:
+        mode.append("другие города")
+    mode_text = f" ({', '.join(mode)})" if mode else ""
+
+    await message.answer(f"Нашёл {len(valid_ids)} анкет{mode_text} 🔍")
     await state.set_state(Search.viewing)
-    await state.update_data(candidates=valid_ids, index=0)
+    await state.update_data(candidates=valid_ids, index=0, relax_gender=relax_gender, relax_city=relax_city)
     await show_next_profile(message, state)
+
+
+
+@router.callback_query(F.data == "search_relax_gender")
+async def search_relax_gender(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    try:
+        await callback.message.edit_text("Ищем всех в твоём городе...")
+    except Exception:
+        await callback.message.answer("Ищем всех в твоём городе...")
+    await start_search(callback.message, state, relax_gender=True, relax_city=False)
+
+
+@router.callback_query(F.data == "search_relax_city")
+async def search_relax_city(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    try:
+        await callback.message.edit_text("Ищем в других городах...")
+    except Exception:
+        await callback.message.answer("Ищем в других городах...")
+    await start_search(callback.message, state, relax_gender=True, relax_city=True)
+
+
+@router.callback_query(F.data == "search_cancel")
+async def search_cancel(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await callback.message.answer("Ок, заходи позже 🍻", reply_markup=main_menu_kb())
+    await state.clear()
 
 
 async def show_next_profile(message: Message, state: FSMContext):
@@ -1064,7 +1207,8 @@ async def edit_height(message: Message, state: FSMContext):
 
 @router.message(Edit.city)
 async def edit_city(message: Message, state: FSMContext):
-    update_user_field(message.from_user.id, "city", message.text.strip().title())
+    city = normalize_city(message.text.strip())
+    update_user_field(message.from_user.id, "city", city)
     await message.answer("Город обновлён ✅", reply_markup=main_menu_kb())
     await state.clear()
 
