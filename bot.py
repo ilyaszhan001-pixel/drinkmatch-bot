@@ -105,6 +105,33 @@ def count_users() -> int:
     return n
 
 
+def touch_user(user_id: int):
+    """Обновить время последней активности"""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE users SET last_active = ? WHERE user_id = ?",
+        (datetime.now().isoformat(), user_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def count_online(minutes: int = 10) -> int:
+    """Сколько людей были активны за последние N минут"""
+    from datetime import timedelta
+    conn = get_conn()
+    cur = conn.cursor()
+    since = (datetime.now() - timedelta(minutes=minutes)).isoformat()
+    cur.execute(
+        "SELECT COUNT(*) FROM users WHERE is_active = 1 AND last_active IS NOT NULL AND last_active >= ?",
+        (since,)
+    )
+    n = cur.fetchone()[0]
+    conn.close()
+    return n
+
+
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
@@ -131,7 +158,7 @@ def init_db():
     )
     """)
     # Мягкая миграция для старых баз
-    for col, typ in [("lat", "REAL"), ("lon", "REAL"), ("height", "INTEGER")]:
+    for col, typ in [("lat", "REAL"), ("lon", "REAL"), ("height", "INTEGER"), ("last_active", "TEXT")]:
         try:
             cur.execute(f"ALTER TABLE users ADD COLUMN {col} {typ}")
         except Exception:
@@ -579,7 +606,11 @@ def main_menu_kb():
 
 def stats_text() -> str:
     total = count_users()
-    return f"🟢 Бот онлайн\n👥 Зарегистрировано: <b>{total}</b>"
+    online = count_online(10)
+    return (
+        f"🟢 Онлайн сейчас: <b>{online}</b>\n"
+        f"👥 Зарегистрировано: <b>{total}</b>"
+    )
 
 async def send_main_menu(message: Message, extra: str = ""):
     """Показать меню с актуальной статистикой"""
@@ -640,11 +671,52 @@ def confirm_delete_kb():
 # ==================== РОУТЕР ====================
 router = Router()
 
+# Обновляем "онлайн" при любом действии пользователя
+from aiogram import BaseMiddleware
+from typing import Callable, Dict, Any, Awaitable
+
+class ActivityMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[Message, Dict[str, Any]], Awaitable[Any]],
+        event: Message,
+        data: Dict[str, Any],
+    ) -> Any:
+        user = getattr(event, "from_user", None)
+        if user and not user.is_bot:
+            try:
+                touch_user(user.id)
+            except Exception:
+                pass
+        return await handler(event, data)
+
+router.message.middleware(ActivityMiddleware())
+
+class CallbackActivityMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[CallbackQuery, Dict[str, Any]], Awaitable[Any]],
+        event: CallbackQuery,
+        data: Dict[str, Any],
+    ) -> Any:
+        user = getattr(event, "from_user", None)
+        if user and not user.is_bot:
+            try:
+                touch_user(user.id)
+            except Exception:
+                pass
+        return await handler(event, data)
+
+router.callback_query.middleware(CallbackActivityMiddleware())
+
+
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     set_chat_partner(message.from_user.id, None)
+    if get_user(message.from_user.id):
+        touch_user(message.from_user.id)
 
     user = get_user(message.from_user.id)
     if user:
@@ -652,21 +724,17 @@ async def cmd_start(message: Message, state: FSMContext):
         update_user_field(message.from_user.id, "username", message.from_user.username)
         update_user_field(message.from_user.id, "full_name", message.from_user.full_name)
 
-        total = count_users()
         await message.answer(
             f"С возвращением, {user['full_name'] or message.from_user.first_name}! 🍻\n\n"
-            f"🟢 Бот онлайн\n"
-            f"👥 Зарегистрировано: <b>{total}</b>\n\n"
+            f"{stats_text()}\n\n"
             "Используй меню ниже:",
             reply_markup=main_menu_kb(),
             parse_mode="HTML"
         )
     else:
-        total = count_users()
         await message.answer(
             "Привет! Это <b>DrinkMatch</b> 🍻\n\n"
-            f"🟢 Бот онлайн\n"
-            f"👥 Уже зарегистрировано: <b>{total}</b>\n\n"
+            f"{stats_text()}\n\n"
             "Бот для поиска людей, с кем можно выпить.\n"
             "Давай создадим твою анкету.\n\n"
             "Укажи свой пол:",
@@ -839,14 +907,7 @@ async def reg_photo(message: Message, state: FSMContext):
     }
     save_user(user_data)
 
-    total = count_users()
-    await message.answer(
-        "Анкета создана! 🎉\n\n"
-        f"👥 Всего в боте: <b>{total}</b>\n"
-        "Теперь ты можешь искать людей.",
-        reply_markup=main_menu_kb(),
-        parse_mode="HTML"
-    )
+    await send_main_menu(message, "Анкета создана! 🎉\nТеперь ты можешь искать людей.")
     await state.clear()
 
 
@@ -862,6 +923,8 @@ async def start_search(message: Message, state: FSMContext, relax_gender: bool =
     uid = user_id or message.from_user.id
     set_chat_partner(uid, None)
     await state.clear()
+    if get_user(uid):
+        touch_user(uid)
 
     user = get_user(uid)
     if not user:
@@ -1187,7 +1250,7 @@ async def edit_gender(message: Message, state: FSMContext):
         await message.answer("Выбери кнопку")
         return
     update_user_field(message.from_user.id, "gender", text)
-    await message.answer("Пол обновлён ✅", reply_markup=main_menu_kb())
+    await send_main_menu(message, "Пол обновлён ✅")
     await state.clear()
 
 
@@ -1201,7 +1264,7 @@ async def edit_age(message: Message, state: FSMContext):
         await message.answer("От 18 до 80")
         return
     update_user_field(message.from_user.id, "age", age)
-    await message.answer("Возраст обновлён ✅", reply_markup=main_menu_kb())
+    await send_main_menu(message, "Возраст обновлён ✅")
     await state.clear()
 
 
@@ -1215,7 +1278,7 @@ async def edit_height(message: Message, state: FSMContext):
         await message.answer("От 140 до 230 см")
         return
     update_user_field(message.from_user.id, "height", height)
-    await message.answer("Рост обновлён ✅", reply_markup=main_menu_kb())
+    await send_main_menu(message, "Рост обновлён ✅")
     await state.clear()
 
 
@@ -1223,7 +1286,7 @@ async def edit_height(message: Message, state: FSMContext):
 async def edit_city(message: Message, state: FSMContext):
     city = normalize_city(message.text.strip())
     update_user_field(message.from_user.id, "city", city)
-    await message.answer("Город обновлён ✅", reply_markup=main_menu_kb())
+    await send_main_menu(message, "Город обновлён ✅")
     await state.clear()
 
 
@@ -1234,7 +1297,7 @@ async def edit_looking(message: Message, state: FSMContext):
         await message.answer("Выбери кнопку")
         return
     update_user_field(message.from_user.id, "looking_for", text)
-    await message.answer("Обновлено ✅", reply_markup=main_menu_kb())
+    await send_main_menu(message, "Обновлено ✅")
     await state.clear()
 
 
@@ -1245,7 +1308,7 @@ async def edit_alcohol(message: Message, state: FSMContext):
         await message.answer("Выбери из кнопок")
         return
     update_user_field(message.from_user.id, "alcohol", message.text)
-    await message.answer("Обновлено ✅", reply_markup=main_menu_kb())
+    await send_main_menu(message, "Обновлено ✅")
     await state.clear()
 
 
@@ -1256,14 +1319,14 @@ async def edit_smoking(message: Message, state: FSMContext):
         await message.answer("Выбери из кнопок")
         return
     update_user_field(message.from_user.id, "smoking", message.text)
-    await message.answer("Обновлено ✅", reply_markup=main_menu_kb())
+    await send_main_menu(message, "Обновлено ✅")
     await state.clear()
 
 
 @router.message(Edit.interests)
 async def edit_interests(message: Message, state: FSMContext):
     update_user_field(message.from_user.id, "interests", message.text.strip())
-    await message.answer("Интересы обновлены ✅", reply_markup=main_menu_kb())
+    await send_main_menu(message, "Интересы обновлены ✅")
     await state.clear()
 
 
@@ -1273,7 +1336,7 @@ async def edit_bio(message: Message, state: FSMContext):
         await message.answer("Слишком коротко")
         return
     update_user_field(message.from_user.id, "bio", message.text.strip())
-    await message.answer("Описание обновлено ✅", reply_markup=main_menu_kb())
+    await send_main_menu(message, "Описание обновлено ✅")
     await state.clear()
 
 
@@ -1281,7 +1344,7 @@ async def edit_bio(message: Message, state: FSMContext):
 async def edit_photo(message: Message, state: FSMContext):
     photo_id = message.photo[-1].file_id
     update_user_field(message.from_user.id, "photo_id", photo_id)
-    await message.answer("Фото обновлено ✅", reply_markup=main_menu_kb())
+    await send_main_menu(message, "Фото обновлено ✅")
     await state.clear()
 
 
@@ -1298,14 +1361,14 @@ async def edit_location(message: Message, state: FSMContext):
     lon = message.location.longitude
     update_user_field(message.from_user.id, "lat", lat)
     update_user_field(message.from_user.id, "lon", lon)
-    await message.answer("Геолокация сохранена ✅\nТеперь в анкетах будет показываться расстояние.", reply_markup=main_menu_kb())
+    await send_main_menu(message, "Геолокация сохранена ✅\nТеперь в анкетах будет показываться расстояние.")
     await state.clear()
 
 
 @router.message(Edit.location)
 async def edit_location_skip(message: Message, state: FSMContext):
     if message.text and "пропустить" in message.text.lower():
-        await message.answer("Геолокация не изменена.", reply_markup=main_menu_kb())
+        await send_main_menu(message, "Геолокация не изменена.")
     else:
         await message.answer("Нажми кнопку «📍 Отправить геолокацию» или «Пропустить».")
         return
@@ -1385,11 +1448,11 @@ async def process_chat_message(message: Message, state: FSMContext):
     partner_id = get_chat_partner(message.from_user.id)
     if not partner_id:
         await state.clear()
-        await message.answer("Чат закрыт.", reply_markup=main_menu_kb())
+        await send_main_menu(message, "Чат закрыт.")
         return
 
     if is_blocked(message.from_user.id, partner_id) or is_blocked(partner_id, message.from_user.id):
-        await message.answer("Переписка недоступна (блокировка).", reply_markup=main_menu_kb())
+        await send_main_menu(message, "Переписка недоступна (блокировка).")
         set_chat_partner(message.from_user.id, None)
         await state.clear()
         return
