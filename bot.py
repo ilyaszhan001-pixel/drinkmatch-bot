@@ -106,30 +106,50 @@ def count_users() -> int:
 
 
 def touch_user(user_id: int):
-    """Обновить время последней активности"""
+    """Отметить, что пользователь сейчас онлайн"""
+    if not user_id:
+        return
     conn = get_conn()
     cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS activity (
+            user_id INTEGER PRIMARY KEY,
+            last_seen TEXT
+        )
+    """)
+    now = datetime.now().isoformat()
     cur.execute(
-        "UPDATE users SET last_active = ? WHERE user_id = ?",
-        (datetime.now().isoformat(), user_id)
+        "INSERT OR REPLACE INTO activity (user_id, last_seen) VALUES (?, ?)",
+        (user_id, now)
     )
+    # параллельно пишем в users, если колонка есть
+    try:
+        cur.execute("UPDATE users SET last_active = ? WHERE user_id = ?", (now, user_id))
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
 
-def count_online(minutes: int = 10) -> int:
+def count_online(minutes: int = 15) -> int:
     """Сколько людей были активны за последние N минут"""
     from datetime import timedelta
     conn = get_conn()
     cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS activity (
+            user_id INTEGER PRIMARY KEY,
+            last_seen TEXT
+        )
+    """)
     since = (datetime.now() - timedelta(minutes=minutes)).isoformat()
     cur.execute(
-        "SELECT COUNT(*) FROM users WHERE is_active = 1 AND last_active IS NOT NULL AND last_active >= ?",
+        "SELECT COUNT(*) FROM activity WHERE last_seen >= ?",
         (since,)
     )
     n = cur.fetchone()[0]
     conn.close()
-    return n
+    return int(n or 0)
 
 
 def init_db():
@@ -606,7 +626,7 @@ def main_menu_kb():
 
 def stats_text() -> str:
     total = count_users()
-    online = count_online(10)
+    online = count_online(15)
     return (
         f"🟢 Онлайн сейчас: <b>{online}</b>\n"
         f"👥 Зарегистрировано: <b>{total}</b>"
@@ -614,6 +634,9 @@ def stats_text() -> str:
 
 async def send_main_menu(message: Message, extra: str = ""):
     """Показать меню с актуальной статистикой"""
+    uid = getattr(getattr(message, "from_user", None), "id", None) or getattr(message, "chat", None) and message.chat.id
+    if uid:
+        touch_user(uid)
     text = stats_text()
     if extra:
         text = extra.strip() + "\n\n" + text
@@ -715,8 +738,7 @@ router.callback_query.middleware(CallbackActivityMiddleware())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     set_chat_partner(message.from_user.id, None)
-    if get_user(message.from_user.id):
-        touch_user(message.from_user.id)
+    touch_user(message.from_user.id)  # всегда отмечаем онлайн
 
     user = get_user(message.from_user.id)
     if user:
